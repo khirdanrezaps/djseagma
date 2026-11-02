@@ -1,2 +1,19 @@
+# Blender
 render/
 *.blend1
+
+# Unreal Engine (generated on first open / rebuilt locally)
+Binaries/
+Intermediate/
+Saved/
+DerivedDataCache/
+.vs/
+.vscode/
+.idea/
+*.sln
+*.VC.db
+*.opensdf
+*.sdf
+*.suo
+*.xcworkspace
+.mcp.json
