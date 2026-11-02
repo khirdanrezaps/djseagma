@@ -28,5 +28,20 @@
    4.0,
    14.0
   ]
+ },
+ "floor": {
+  "file": "T_Smoke_Floor.png",
+  "cols": 4,
+  "rows": 20,
+  "frames": 80,
+  "frame_px": [
+   1536,
+   134
+  ],
+  "size_m": [
+   46.0,
+   10.0,
+   4.0
+  ]
  }
 }
