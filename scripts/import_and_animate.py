@@ -354,7 +354,10 @@ def make_smoke(mpc):
     meta = json.load(open(PLATES_JSON))
     out = {"card": import_card_mesh(), "meta": meta}
     for key in ("gate", "wall", "floor"):
-        info = meta[key]
+        info = meta.get(key)
+        if info is None or not os.path.isfile(os.path.join(PLATES_DIR, info["file"])):
+            unreal.log_warning("[SeagmaAnim] smoke plate '%s' missing, skipping its cards" % key)
+            continue
         tex = import_texture(os.path.join(PLATES_DIR, info["file"]), "T_Smoke_" + key.capitalize())
         out[key] = make_smoke_material("M_Smoke_" + key.capitalize(), tex, info, mpc)
     return out
@@ -406,7 +409,7 @@ def build_set(data, logo_mesh, mats):
     smoke = mats.get("smoke")
 
     def card(label, loc, w_cm, h_cm, mat_key, offset, parent=None, speed=1.0, brightness=None):
-        if smoke is None:
+        if smoke is None or mat_key not in smoke:
             return None
         mi = smoke_instance(smoke[mat_key], "MI_Smoke_" + label, offset, speed, brightness)
         a = spawn_mesh(smoke["card"], mi, loc, (w_cm / 100.0, 1.0, h_cm / 100.0), label)

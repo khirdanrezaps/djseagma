@@ -1,0 +1,32 @@
+{
+ "gate": {
+  "file": "T_Smoke_Gate.png",
+  "cols": 10,
+  "rows": 8,
+  "frames": 80,
+  "frame_px": [
+   384,
+   909
+  ],
+  "size_m": [
+   7.6,
+   3.0,
+   18.0
+  ]
+ },
+ "wall": {
+  "file": "T_Smoke_Wall.png",
+  "cols": 8,
+  "rows": 10,
+  "frames": 80,
+  "frame_px": [
+   768,
+   414
+  ],
+  "size_m": [
+   26.0,
+   4.0,
+   14.0
+  ]
+ }
+}
