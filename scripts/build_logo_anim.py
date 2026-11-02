@@ -24,7 +24,7 @@ import bpy
 
 FPS = 24
 FRAME_END = 1080           # 45 s
-BPM = 128
+BPM = 150
 COLL_NAME = "SEAGMA_ANIM"
 LOGO_NAME = "memories.001"
 LOGO_EMPTY = "logo"
@@ -405,27 +405,51 @@ def build():
     setup_render(scene)
 
 
-def animate_strobes(tubes):
-    beat = FPS * 60.0 / BPM  # frames per beat
-    n_beats = int((FRAME_END - F_TUBES_START) / beat) + 1
-    for ob in tubes:
-        ob.keyframe_insert('["glow"]', frame=1)
-    for b in range(n_beats):
-        f0 = F_TUBES_START + b * beat
-        bar = b // 4
-        if f0 < F_GATE_OPEN_START:
-            p_on = 0.35                      # flicker through the seam
-        elif (bar % 2) == 0:
-            p_on = 0.85                      # full strobe bar
+def tube_glow_curve():
+    """Per-frame tube brightness 0..1, measured from the reference video (150 BPM, beat 0.4 s).
+    All tubes move together:
+      13.0-26.7 s  dim glow + soft pulse once per bar (1.6 s)
+      26.7-33.7 s  sharp flash every beat
+      33.7-37.0 s  every half beat
+      37.0-40.8 s  triplets (build-up)
+      40.8-44.5 s  break (off)
+      44.5 s-      flash every beat
+    """
+    beat, bar = 0.4, 1.6
+    vals = []
+    for f in range(1, FRAME_END + 1):
+        t = (f - 1) / FPS
+        if t < 13.0:
+            v = 0.0
+        elif t < 26.7:
+            since = (t - 26.7) % bar                     # bars locked to the 26.7 s drop
+            pulse = math.exp(-since / 0.35) if since > 0.06 else since / 0.06
+            fade = min(1.0, (t - 13.0) / 1.5)
+            v = fade * (0.3 + 0.7 * pulse)
+        elif t < 33.7:
+            v = 1.0 if ((t - 26.7) % beat) < 2.0 / FPS else 0.0
+        elif t < 37.0:
+            v = 1.0 if ((t - 33.7) % (beat / 2)) < 1.5 / FPS else 0.0
+        elif t < 40.8:
+            v = 1.0 if ((f - int(37.0 * FPS)) % 3) == 0 else 0.0
+        elif t < 44.5:
+            v = 0.0
         else:
-            p_on = 0.12                      # quiet bar
-        hold = 3 if (bar % 2) == 0 else 5
+            v = 1.0 if ((t - 44.5) % beat) < 2.0 / FPS else 0.0
+        vals.append(round(v, 3))
+    return vals
+
+
+def animate_strobes(tubes):
+    curve = tube_glow_curve()
+    prev = None
+    for f, v in enumerate(curve, start=1):
+        if v == prev:
+            continue
         for ob in tubes:
-            if rng.random() < p_on:
-                ob["glow"] = rng.uniform(18.0, 30.0)
-                ob.keyframe_insert('["glow"]', frame=round(f0))
-                ob["glow"] = 0.0
-                ob.keyframe_insert('["glow"]', frame=round(f0) + hold)
+            ob["glow"] = v * 25.0
+            ob.keyframe_insert('["glow"]', frame=f)
+        prev = v
     for ob in tubes:
         ob["glow"] = 0.0
         set_interpolation(ob, "CONSTANT")

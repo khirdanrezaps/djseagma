@@ -13,7 +13,7 @@ inside Unreal:
         0-4 s   fade in on a close-up of the cloud gate
         4-17 s  camera pulls back, light tubes flicker through the seam
         17-28 s gates slide open, logo revealed
-        28-45 s wide hold, tubes strobe on the beat (128 BPM)
+        28-45 s wide hold, tubes strobe with the pattern measured from the reference (150 BPM)
 
 Run inside the Unreal Editor (Tools > Execute Python Script..., or Output Log in "Cmd" mode:
     py "<project>/scripts/import_and_animate.py"
@@ -47,13 +47,16 @@ TUBE_LIGHT_LUMENS = 60.0    # light each lit tube throws into the fog
 TUBE_FOG_SCATTER = 6.0      # how much the tube lights glow inside the volumetric fog
 SATURATION = 0.12           # reference is almost black & white
 CLOUD_DENSITY = 0.35        # extinction per cm inside the cloud
+LOGO_REFLECT_LUMENS = 4000.0  # what the chrome logo reflects (specular-only card behind camera)
 
 PROJECT_DIR = unreal.Paths.convert_relative_path_to_full(unreal.Paths.project_dir())
 SRC_DIR = os.path.join(PROJECT_DIR, "SourceAssets")
 LOGO_FBX = os.path.join(SRC_DIR, "SM_SeagmaLogo.fbx")
-CLOUD_VDB = os.path.join(SRC_DIR, "VDB", "T_SeagmaCloudNoise.vdb")
+CLOUD_VDB = os.path.join(SRC_DIR, "VDB", "Smoke", "SeagmaSmoke_0000.vdb")      # simulated, looping
+CLOUD_VDB_STATIC = os.path.join(SRC_DIR, "VDB", "T_SeagmaCloudNoise.vdb")     # fallback (static)
+SMOKE_SPEED = 0.6           # simulation frames advanced per sequence frame (lower = slower churn)
 VDB_DIR = ROOT + "/Volumes"
-SVT_RES = 128.0             # voxels per side in the VDB (1 voxel = 1 unit before actor scale)
+SVT_RES = 64.0              # voxels per side of the smoke VDB (1 voxel = 1 unit before actor scale)
 DATA_JSON = os.path.join(SRC_DIR, "seagma_anim_data.json")
 
 asset_tools = unreal.AssetToolsHelpers.get_asset_tools()
@@ -180,11 +183,31 @@ def make_cloud():
     return finish(m)
 
 
-def make_tube():
+MPC_NAME = "MPC_SeagmaTubes"
+
+
+def make_mpc():
+    """Material Parameter Collection with one scalar, TubeGlow (0..1), keyed by the sequence."""
+    path = MAT_DIR + "/" + MPC_NAME
+    mpc = eal.load_asset(path) if eal.does_asset_exist(path) else asset_tools.create_asset(
+        MPC_NAME, MAT_DIR, unreal.MaterialParameterCollection, unreal.MaterialParameterCollectionFactoryNew())
+    p = unreal.CollectionScalarParameter()
+    p.set_editor_property("parameter_name", "TubeGlow")
+    p.set_editor_property("default_value", 0.0)
+    mpc.set_editor_property("scalar_parameters", [p])
+    eal.save_loaded_asset(mpc)
+    return mpc
+
+
+def make_tube(mpc=None):
     m = new_material("M_Seagma_LightTube")
     mel.connect_material_property(color(m, (0.02, 0.02, 0.02), -400, -200), "", unreal.MaterialProperty.MP_BASE_COLOR)
-    mel.connect_material_property(color(m, (TUBE_EMISSIVE, TUBE_EMISSIVE * 0.97, TUBE_EMISSIVE * 0.93), -400, 0), "",
-                                  unreal.MaterialProperty.MP_EMISSIVE_COLOR)
+    emis = color(m, (TUBE_EMISSIVE, TUBE_EMISSIVE * 0.97, TUBE_EMISSIVE * 0.93), -700, 0)
+    if mpc is not None:
+        cp = expr(m, unreal.MaterialExpressionCollectionParameter, -700, 150, collection=mpc,
+                  parameter_name="TubeGlow")
+        emis = node2(m, unreal.MaterialExpressionMultiply, emis, cp, -400, 50)
+    mel.connect_material_property(emis, "", unreal.MaterialProperty.MP_EMISSIVE_COLOR)
     return finish(m)
 
 
@@ -207,14 +230,16 @@ def make_ground():
 def import_cloud_svt():
     """OpenVDB -> Sparse Volume Texture."""
     task = unreal.AssetImportTask()
-    task.filename = CLOUD_VDB
+    use_smoke = os.path.isfile(CLOUD_VDB)
+    task.filename = CLOUD_VDB if use_smoke else CLOUD_VDB_STATIC
     task.destination_path = VDB_DIR
     task.automated = True
     task.replace_existing = True
     task.save = True
     asset_tools.import_asset_tasks([task])
     svt_cls = getattr(unreal, "SparseVolumeTexture", None)
-    candidates = list(task.imported_object_paths or []) + [VDB_DIR + "/T_SeagmaCloudNoise"]
+    candidates = list(task.imported_object_paths or []) + [VDB_DIR + "/SeagmaSmoke_0000", VDB_DIR + "/SeagmaSmoke",
+                                                           VDB_DIR + "/T_SeagmaCloudNoise"]
     for path in candidates:
         obj = eal.load_asset(path)
         if obj is not None and (svt_cls is None or isinstance(obj, svt_cls)):
@@ -256,26 +281,20 @@ def make_cloud_volume_material(svt):
     p = node2(m, unreal.MaterialExpressionSubtract, wp, op, -2200, 50)
     t = expr(m, unreal.MaterialExpressionTime, -2400, 400)
 
-    def octave(scale_name, scale, flow_name, flow, y):
-        inv = node2(m, unreal.MaterialExpressionDivide, p, p_scalar(m, scale_name, scale, -2200, y), -2000, y)
-        mv = node2(m, unreal.MaterialExpressionMultiply, t, p_vector(m, flow_name, flow, -2200, y + 100),
-                   -2000, y + 100)
-        uvw = node2(m, unreal.MaterialExpressionAdd, inv, mv, -1800, y)
-        fr = expr(m, unreal.MaterialExpressionFrac, -1650, y)
-        mel.connect_material_expressions(uvw, "", fr, "")
-        smp = expr(m, unreal.MaterialExpressionSparseVolumeTextureSample, -1450, y)
-        set_first(smp, ["sparse_volume_texture"], svt)
-        mel.connect_material_expressions(fr, "", smp, "UVW")
-        mask = expr(m, unreal.MaterialExpressionComponentMask, -1200, y, r=True, g=False, b=False, a=False)
-        mel.connect_material_expressions(smp, "", mask, "")
-        return mask
-
-    o1 = octave("Scale1", 600.0, "Flow1", (0.015, 0.0, 0.03), -300)
-    o2 = octave("Scale2", 240.0, "Flow2", (-0.02, 0.01, 0.05), 200)
-    mix = expr(m, unreal.MaterialExpressionLinearInterpolate, -1000, -50)
-    mel.connect_material_expressions(o1, "", mix, "A")
-    mel.connect_material_expressions(o2, "", mix, "B")
-    mel.connect_material_expressions(const(m, 0.35, -1200, 50), "", mix, "Alpha")
+    # tile the simulated smoke over the element: uvw = frac(p / Scale1 + Offset + t * Drift)
+    inv = node2(m, unreal.MaterialExpressionDivide, p, p_scalar(m, "Scale1", 600.0, -2200, -300), -2000, -300)
+    drift = node2(m, unreal.MaterialExpressionMultiply, t, p_vector(m, "Drift", (0.0, 0.0, 0.004), -2200, -150),
+                  -2000, -150)
+    uvw = node2(m, unreal.MaterialExpressionAdd, inv, drift, -1850, -250)
+    uvw = node2(m, unreal.MaterialExpressionAdd, uvw, p_vector(m, "Offset", (0.0, 0.0, 0.0), -2000, -50),
+                -1700, -200)
+    fr = expr(m, unreal.MaterialExpressionFrac, -1550, -200)
+    mel.connect_material_expressions(uvw, "", fr, "")
+    smp = expr(m, unreal.MaterialExpressionSparseVolumeTextureSample, -1350, -200)
+    set_first(smp, ["sparse_volume_texture"], svt)
+    mel.connect_material_expressions(fr, "", smp, "UVW")
+    mix = expr(m, unreal.MaterialExpressionComponentMask, -1100, -200, r=True, g=False, b=False, a=False)
+    mel.connect_material_expressions(smp, "", mix, "")
 
     # rounded-box erosion towards the volume faces
     rel = node2(m, unreal.MaterialExpressionDivide, p, p_vector(m, "HalfSize", (380.0, 150.0, 900.0), -2200, 700),
@@ -285,8 +304,8 @@ def make_cloud_volume_material(svt):
                                                                       -1800, 800), -1600, 700)
     field = node2(m, unreal.MaterialExpressionSubtract, mix, edge, -800, 100)
 
-    thr = p_scalar(m, "Threshold", 0.46, -1000, 300)
-    soft = p_scalar(m, "Softness", 0.04, -1000, 400)
+    thr = p_scalar(m, "Threshold", 0.45, -1000, 300)
+    soft = p_scalar(m, "Softness", 0.07, -1000, 400)
     lo = node2(m, unreal.MaterialExpressionSubtract, thr, soft, -800, 300)
     hi = node2(m, unreal.MaterialExpressionAdd, thr, soft, -800, 400)
     st = expr(m, unreal.MaterialExpressionSmoothStep, -600, 200)
@@ -302,7 +321,7 @@ def make_cloud_volume_material(svt):
     return finish(m)
 
 
-def cloud_instance(parent, name, half_size, edge_w, threshold=0.46, scale1=600.0, density=None):
+def cloud_instance(parent, name, half_size, edge_w, threshold=0.45, scale1=600.0, density=None, offset=(0, 0, 0)):
     path = MAT_DIR + "/" + name
     mi = eal.load_asset(path) if eal.does_asset_exist(path) else asset_tools.create_asset(
         name, MAT_DIR, unreal.MaterialInstanceConstant, unreal.MaterialInstanceConstantFactoryNew())
@@ -313,6 +332,8 @@ def cloud_instance(parent, name, half_size, edge_w, threshold=0.46, scale1=600.0
                                                      unreal.LinearColor(edge_w[0], edge_w[1], edge_w[2], 0))
     mel.set_material_instance_scalar_parameter_value(mi, "Threshold", threshold)
     mel.set_material_instance_scalar_parameter_value(mi, "Scale1", scale1)
+    mel.set_material_instance_vector_parameter_value(mi, "Offset",
+                                                     unreal.LinearColor(offset[0], offset[1], offset[2], 0))
     if density is not None:
         mel.set_material_instance_scalar_parameter_value(mi, "Density", density)
     mel.update_material_instance(mi)
@@ -365,15 +386,27 @@ def build_set(data, logo_mesh, mats):
 
     vol_master = mats.get("cloud_volume")
 
-    def cloud(label, loc, size, edge_w, threshold=0.46, scale1=600.0, density=None):
+    actors["volumes"] = []
+
+    def cloud(label, loc, size, edge_w, threshold=0.45, scale1=600.0, density=None):
         half = (size[0] / 2.0, size[1] / 2.0, size[2] / 2.0)
         if vol_master is not None:
+            idx = len(actors["volumes"])
             a = spawn(unreal.HeterogeneousVolume, loc, label=label)
             comp = a.get_component_by_class(unreal.HeterogeneousVolumeComponent)
             set_first(comp, ["pivot_at_centroid", "b_pivot_at_centroid"], True)
+            # Movie Render Queue: wait for the volume data to stream in, otherwise clouds render empty
+            set_first(comp, ["issue_blocking_requests", "b_issue_blocking_requests"], True)
+            set_first(comp, ["playing", "b_playing"], False)      # the sequence drives "Frame"
+            set_first(comp, ["looping", "b_looping"], True)
+            set_first(comp, ["step_factor"], 0.5)                 # finer ray march -> crisper billows
+            set_first(comp, ["shadow_step_factor"], 1.0)
+            set_first(comp, ["cast_shadow"], True)
+            offset = (0.137 * idx, 0.311 * idx, 0.71 * idx)       # decorrelate the elements
             comp.set_material(0, cloud_instance(vol_master, "MI_Cloud_" + label, half, edge_w, threshold,
-                                                scale1, density))
+                                                scale1, density, offset))
             a.set_actor_scale3d(V((size[0] / SVT_RES, size[1] / SVT_RES, size[2] / SVT_RES)))
+            actors["volumes"].append(a)
             return a
         # fallback when the VDB could not be imported: solid blocks with the moving-noise surface
         return spawn_mesh(cube, mats.get("cloud"), loc, (size[0] / 100, size[1] / 100, size[2] / 100), label)
@@ -426,7 +459,7 @@ def tube_light(t):
     set_first(c, ["volumetric_scattering_intensity"], TUBE_FOG_SCATTER)
     set_first(c, ["cast_shadows"], False)
     set_first(c, ["light_color"], unreal.Color(255, 248, 238, 255))
-    a.set_actor_hidden_in_game(True)
+    c.set_intensity(0.0)                       # the sequence keys the intensity with the strobe
     return a
 
 
@@ -440,6 +473,18 @@ def build_lights():
     kc.set_editor_property("source_width", 1800.0)
     kc.set_editor_property("source_height", 600.0)
     kc.set_editor_property("attenuation_radius", 6000.0)
+
+    # big soft card behind the camera that only the chrome sees (specular only)
+    refl = spawn(unreal.RectLight, (0, 2700, 650), (0, -8, -90), "Logo_Reflect")
+    rc = refl.get_component_by_class(unreal.RectLightComponent)
+    set_first(rc, ["intensity_units"], unreal.LightUnits.LUMENS)
+    rc.set_intensity(LOGO_REFLECT_LUMENS)
+    set_first(rc, ["source_width"], 2600.0)
+    set_first(rc, ["source_height"], 900.0)
+    set_first(rc, ["attenuation_radius"], 6000.0)
+    set_first(rc, ["diffuse_scale"], 0.0)
+    set_first(rc, ["volumetric_scattering_intensity"], 0.0)
+    set_first(rc, ["cast_shadows"], False)
 
     fill = spawn(unreal.RectLight, (0, 2400, 1200), (0, -25, -90), "Fill_Front")
     fc = fill.get_component_by_class(unreal.RectLightComponent)
@@ -625,12 +670,15 @@ def animate_sequence(seq, data, actors):
         stage("sequence: camera cut", camera_cut, seq, cam_b, end)
     if gate_actors:
         stage("sequence: gates open", key_gates, data, gate_actors, bind(gate_actors), end)
-    if tubes:
-        stage("sequence: light tube strobes", key_tubes, tubes, bind([a for a, _ in tubes]), end)
+    glow = data.get("tube_glow")
+    if glow and actors.get("mpc") is not None:
+        stage("sequence: tube strobe (MPC TubeGlow)", key_tube_mpc, seq, actors["mpc"], glow, end)
     tube_lights = actors.get("tube_lights", [])
-    if tube_lights:
-        stage("sequence: tube light strobes (fog glow)", key_tubes, tube_lights,
-              bind([a for a, _ in tube_lights]), end)
+    if glow and tube_lights:
+        stage("sequence: tube light strobe (fog glow)", key_tube_lights, seq, tube_lights, glow, end)
+    vols = actors.get("volumes", [])
+    if vols:
+        stage("sequence: smoke frames", key_volume_frames, seq, vols, end, actors.get("smoke_frames", 1))
     stage("sequence: fade in", key_fade, seq, data, end)
 
     eal.save_loaded_asset(seq)
@@ -680,18 +728,84 @@ def key_gates(data, gate_actors, gate_b, end):
                           (scale.x, scale.y, scale.z))
 
 
-def key_tubes(tubes, tube_b, end):
-    for b, (a, t) in zip(tube_b, tubes):
-        vtrack = b.add_track(unreal.MovieSceneVisibilityTrack)
-        vtrack.set_property_name_and_path("bHidden", "bHidden")
-        vsec = vtrack.add_section()
-        vsec.set_range(0, end)
-        vch = vsec.get_channels_by_type(unreal.MovieSceneScriptingBoolChannel)[0]
-        vch.add_key(F(1), True, 0.0, unreal.MovieSceneTimeUnit.DISPLAY_RATE)       # hidden = off
-        for frame, glow in t["glow_keys"]:
-            if frame <= 1:
-                continue
-            vch.add_key(F(frame), not (glow > 0.0), 0.0, unreal.MovieSceneTimeUnit.DISPLAY_RATE)
+def changes(values):
+    """(frame, value) where the curve changes; frames are Blender-style (1-based)."""
+    out, prev = [], None
+    for f, v in enumerate(values, start=1):
+        if v != prev:
+            out.append((f, v))
+            prev = v
+    return out
+
+
+def key_tube_mpc(seq, mpc, glow, end):
+    track = seq.add_track(unreal.MovieSceneMaterialParameterCollectionTrack)
+    track.set_editor_property("mpc", mpc)
+    sec = track.add_section()
+    sec.set_range(0, end)
+    for f, v in changes(glow):
+        sec.add_scalar_parameter_key("TubeGlow", F(f), float(v))
+    set_constant_interp(sec)
+
+
+def component_binding(seq, actor_b, actor, comp):
+    for child in actor_b.get_child_possessables():
+        if comp.get_name() in str(child.get_display_name()) or comp.get_class().get_name() in str(child.get_name()):
+            return child
+    return seq.add_possessable(comp)
+
+
+def key_tube_lights(seq, tube_lights, glow, end):
+    keys = changes(glow)
+    for b, (a, t) in zip(bind([a for a, _ in tube_lights]), tube_lights):
+        comp = a.get_component_by_class(unreal.RectLightComponent)
+        cb = component_binding(seq, b, a, comp)
+        tr = cb.add_track(unreal.MovieSceneFloatTrack)
+        tr.set_property_name_and_path("Intensity", "Intensity")
+        sec = tr.add_section()
+        sec.set_range(0, end)
+        ch = double_channels(sec)[0]
+        for f, v in keys:
+            add_key(ch, f, float(v) * TUBE_LIGHT_LUMENS, unreal.MovieSceneKeyInterpolation.CONSTANT)
+
+
+def key_volume_frames(seq, vols, end, n_frames):
+    """Play the looping smoke sim: Frame = (offset + t * SMOKE_SPEED) mod n_frames.
+    Linear keys between loop points, constant key on the last frame before each wrap."""
+    n = float(max(1, n_frames))
+    for i, (b, a) in enumerate(zip(bind(vols), vols)):
+        comp = a.get_component_by_class(unreal.HeterogeneousVolumeComponent)
+        cb = component_binding(seq, b, a, comp)
+        tr = cb.add_track(unreal.MovieSceneFloatTrack)
+        tr.set_property_name_and_path("Frame", "Frame")
+        sec = tr.add_section()
+        sec.set_range(0, end)
+        ch = double_channels(sec)[0]
+        val = (i * 37.0) % n
+        add_key(ch, 1, val, unreal.MovieSceneKeyInterpolation.LINEAR)
+        f = 1
+        while f <= end:
+            steps = int((n - 1e-3 - val) / SMOKE_SPEED)         # whole frames before passing the loop end
+            last = min(end + 1, f + max(steps, 0))
+            v_last = val + (last - f) * SMOKE_SPEED
+            add_key(ch, last, v_last, unreal.MovieSceneKeyInterpolation.CONSTANT)
+            if last >= end + 1:
+                break
+            f = last + 1
+            val = v_last + SMOKE_SPEED - n                       # wrap to the start of the loop
+            add_key(ch, f, val, unreal.MovieSceneKeyInterpolation.LINEAR)
+
+
+def set_constant_interp(section):
+    try:
+        for ch in section.get_all_channels():
+            for k in ch.get_keys():
+                try:
+                    k.set_interpolation_mode(unreal.RichCurveInterpMode.RCIM_CONSTANT)
+                except Exception:
+                    pass
+    except Exception:
+        pass
 
 
 def key_fade(seq, data, end):
@@ -706,8 +820,11 @@ def key_fade(seq, data, end):
 # --------------------------------------------------------------------------- main
 def make_materials():
     mats = {}
-    for key, fn in (("chrome", make_chrome), ("cloud", make_cloud), ("tube", make_tube), ("wire", make_wire),
-                    ("ground", make_ground)):
+    mpc = stage("material parameter collection (tube strobe)", make_mpc)
+    if mpc is not None:
+        mats["mpc"] = mpc
+    for key, fn in (("chrome", make_chrome), ("cloud", make_cloud), ("tube", lambda: make_tube(mpc)),
+                    ("wire", make_wire), ("ground", make_ground)):
         m = stage("material " + key, fn)
         if m is not None:
             mats[key] = m
@@ -763,6 +880,10 @@ def main():
         task.enter_progress_frame(1, "Building level")
         stage("open/create level " + MAP_PATH, open_or_create_level)
         actors = stage("spawn set actors", build_set, data, logo_mesh, mats) or {}
+        actors["mpc"] = mats.get("mpc")
+        smoke_dir = os.path.dirname(CLOUD_VDB)
+        actors["smoke_frames"] = len([f for f in os.listdir(smoke_dir) if f.endswith(".vdb")]) \
+            if os.path.isdir(smoke_dir) else 1
         task.enter_progress_frame(1, "Animating Level Sequence")
         if seq is not None:
             stage("animate sequence", animate_sequence, seq, data, actors)
