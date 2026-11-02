@@ -4,7 +4,7 @@ import_and_animate.py - Unreal Engine 5.8 editor script for DJ Seagma Anim.
 Rebuilds the Blender logo animation (DJ Seagma 2026.blend / scripts/build_logo_anim.py)
 inside Unreal:
   1. imports SourceAssets/SM_SeagmaLogo.fbx into /Game/Seagma/Meshes
-  2. creates materials (chrome logo, moving-cloud gates, emissive light tubes, wires)
+  2. creates materials (chrome logo, smoke flipbook cards rendered from the smoke sim, light tubes, wires)
   3. creates level /Game/Seagma/Maps/LV_SeagmaLogo and spawns the set
      (cloud gates, side pillars, back wall, floor, light tubes, wires, lights, fog, cine camera)
   4. creates Level Sequence /Game/Seagma/Cinematics/LS_SeagmaLogo through
@@ -52,11 +52,14 @@ LOGO_REFLECT_LUMENS = 4000.0  # what the chrome logo reflects (specular-only car
 PROJECT_DIR = unreal.Paths.convert_relative_path_to_full(unreal.Paths.project_dir())
 SRC_DIR = os.path.join(PROJECT_DIR, "SourceAssets")
 LOGO_FBX = os.path.join(SRC_DIR, "SM_SeagmaLogo.fbx")
-CLOUD_VDB = os.path.join(SRC_DIR, "VDB", "Smoke", "SeagmaSmoke_0000.vdb")      # simulated, looping
-CLOUD_VDB_STATIC = os.path.join(SRC_DIR, "VDB", "T_SeagmaCloudNoise.vdb")     # fallback (static)
-SMOKE_SPEED = 0.6           # simulation frames advanced per sequence frame (lower = slower churn)
-VDB_DIR = ROOT + "/Volumes"
-SVT_RES = 64.0              # voxels per side of the smoke VDB (1 voxel = 1 unit before actor scale)
+PLATES_DIR = os.path.join(SRC_DIR, "SmokePlates")      # Cycles-rendered smoke flipbooks (render_smoke_plates.py)
+PLATES_JSON = os.path.join(PLATES_DIR, "smoke_plates.json")
+CARD_FBX = os.path.join(SRC_DIR, "SM_SmokeCard.fbx")
+SMOKE_DIR = ROOT + "/Smoke"
+SMOKE_SPEED = 0.35          # flipbook frames per sequence frame (lower = slower churn)
+SMOKE_BRIGHTNESS = 1.0      # smoke card brightness
+SMOKE_STROBE_GLOW = 0.6     # how much the smoke lights up when the tubes flash
+
 DATA_JSON = os.path.join(SRC_DIR, "seagma_anim_data.json")
 
 asset_tools = unreal.AssetToolsHelpers.get_asset_tools()
@@ -191,10 +194,13 @@ def make_mpc():
     path = MAT_DIR + "/" + MPC_NAME
     mpc = eal.load_asset(path) if eal.does_asset_exist(path) else asset_tools.create_asset(
         MPC_NAME, MAT_DIR, unreal.MaterialParameterCollection, unreal.MaterialParameterCollectionFactoryNew())
-    p = unreal.CollectionScalarParameter()
-    p.set_editor_property("parameter_name", "TubeGlow")
-    p.set_editor_property("default_value", 0.0)
-    mpc.set_editor_property("scalar_parameters", [p])
+    params = []
+    for n in ("TubeGlow", "SmokeFrame"):
+        p = unreal.CollectionScalarParameter()
+        p.set_editor_property("parameter_name", n)
+        p.set_editor_property("default_value", 0.0)
+        params.append(p)
+    mpc.set_editor_property("scalar_parameters", params)
     eal.save_loaded_asset(mpc)
     return mpc
 
@@ -226,35 +232,9 @@ def make_ground():
     return finish(m)
 
 
-# --------------------------------------------------------------------------- heterogeneous volume clouds
-def import_cloud_svt():
-    """OpenVDB -> Sparse Volume Texture."""
-    task = unreal.AssetImportTask()
-    use_smoke = os.path.isfile(CLOUD_VDB)
-    task.filename = CLOUD_VDB if use_smoke else CLOUD_VDB_STATIC
-    task.destination_path = VDB_DIR
-    task.automated = True
-    task.replace_existing = True
-    task.save = True
-    asset_tools.import_asset_tasks([task])
-    svt_cls = getattr(unreal, "SparseVolumeTexture", None)
-    candidates = list(task.imported_object_paths or []) + [VDB_DIR + "/SeagmaSmoke_0000", VDB_DIR + "/SeagmaSmoke",
-                                                           VDB_DIR + "/T_SeagmaCloudNoise"]
-    for path in candidates:
-        obj = eal.load_asset(path)
-        if obj is not None and (svt_cls is None or isinstance(obj, svt_cls)):
-            log("cloud SVT: " + obj.get_path_name())
-            return obj
-    raise RuntimeError("VDB import produced no SparseVolumeTexture (%s)" % CLOUD_VDB)
-
-
+# --------------------------------------------------------------------------- smoke cards (flipbooks)
 def p_scalar(m, name, value, x, y):
     return expr(m, unreal.MaterialExpressionScalarParameter, x, y, parameter_name=name, default_value=value)
-
-
-def p_vector(m, name, rgb, x, y):
-    return expr(m, unreal.MaterialExpressionVectorParameter, x, y, parameter_name=name,
-                default_value=unreal.LinearColor(rgb[0], rgb[1], rgb[2], 0.0))
 
 
 def node2(m, cls, a, b, x, y, ia="A", ib="B"):
@@ -264,81 +244,120 @@ def node2(m, cls, a, b, x, y, ia="A", ib="B"):
     return n
 
 
-def make_cloud_volume_material(svt):
-    """Volume-domain master material for Heterogeneous Volumes.
+def import_texture(png, name):
+    task = unreal.AssetImportTask()
+    task.filename = png
+    task.destination_path = SMOKE_DIR
+    task.destination_name = name
+    task.automated = True
+    task.replace_existing = True
+    task.save = True
+    asset_tools.import_asset_tasks([task])
+    tex = eal.load_asset(SMOKE_DIR + "/" + name)
+    if tex is None:
+        raise RuntimeError("texture import failed: " + png)
+    set_first(tex, ["never_stream"], True)                 # full res in Movie Render Queue
+    set_first(tex, ["lod_group"], unreal.TextureGroup.TEXTUREGROUP_CINEMATIC)
+    set_first(tex, ["mip_gen_settings"], unreal.TextureMipGenSettings.TMGS_NO_MIPMAPS)
+    eal.save_loaded_asset(tex)
+    return tex
 
-    density = smoothstep(lerp(SVT(p/Scale1 + t*Flow1), SVT(p/Scale2 + t*Flow2), 0.35)
-                         - dot((p/HalfSize)^2, EdgeWeights))
-    p is measured from the actor pivot, so the clouds travel with the gates.
-    """
-    m = new_material("M_Seagma_CloudVolume")
-    set_first(m, ["material_domain"], unreal.MaterialDomain.MD_VOLUME)
-    set_first(m, ["blend_mode"], unreal.BlendMode.BLEND_ADDITIVE)
-    set_first(m, ["used_with_heterogeneous_volumes", "b_used_with_heterogeneous_volumes"], True)
 
-    wp = expr(m, unreal.MaterialExpressionWorldPosition, -2400, 0)
-    op = expr(m, unreal.MaterialExpressionObjectPositionWS, -2400, 150)
-    p = node2(m, unreal.MaterialExpressionSubtract, wp, op, -2200, 50)
-    t = expr(m, unreal.MaterialExpressionTime, -2400, 400)
+def import_card_mesh():
+    task = unreal.AssetImportTask()
+    task.filename = CARD_FBX
+    task.destination_path = MESH_DIR
+    task.destination_name = "SM_SmokeCard"
+    task.automated = True
+    task.replace_existing = True
+    task.save = True
+    asset_tools.import_asset_tasks([task])
+    mesh = eal.load_asset(MESH_DIR + "/SM_SmokeCard")
+    if mesh is None:
+        raise RuntimeError("card import failed")
+    return mesh
 
-    # tile the simulated smoke over the element: uvw = frac(p / Scale1 + Offset + t * Drift)
-    inv = node2(m, unreal.MaterialExpressionDivide, p, p_scalar(m, "Scale1", 600.0, -2200, -300), -2000, -300)
-    drift = node2(m, unreal.MaterialExpressionMultiply, t, p_vector(m, "Drift", (0.0, 0.0, 0.004), -2200, -150),
-                  -2000, -150)
-    uvw = node2(m, unreal.MaterialExpressionAdd, inv, drift, -1850, -250)
-    uvw = node2(m, unreal.MaterialExpressionAdd, uvw, p_vector(m, "Offset", (0.0, 0.0, 0.0), -2000, -50),
-                -1700, -200)
-    fr = expr(m, unreal.MaterialExpressionFrac, -1550, -200)
-    mel.connect_material_expressions(uvw, "", fr, "")
-    smp = expr(m, unreal.MaterialExpressionSparseVolumeTextureSample, -1350, -200)
-    set_first(smp, ["sparse_volume_texture"], svt)
-    mel.connect_material_expressions(fr, "", smp, "UVW")
-    mix = expr(m, unreal.MaterialExpressionComponentMask, -1100, -200, r=True, g=False, b=False, a=False)
-    mel.connect_material_expressions(smp, "", mix, "")
 
-    # rounded-box erosion towards the volume faces
-    rel = node2(m, unreal.MaterialExpressionDivide, p, p_vector(m, "HalfSize", (380.0, 150.0, 900.0), -2200, 700),
-                -2000, 650)
-    sq = node2(m, unreal.MaterialExpressionMultiply, rel, rel, -1800, 650)
-    edge = node2(m, unreal.MaterialExpressionDotProduct, sq, p_vector(m, "EdgeWeights", (0.5, 0.5, 0.05),
-                                                                      -1800, 800), -1600, 700)
-    field = node2(m, unreal.MaterialExpressionSubtract, mix, edge, -800, 100)
+def make_smoke_material(name, tex, info, mpc):
+    """Unlit translucent flipbook: frame = (SmokeFrame * Speed + Offset) mod Frames, blended with the next
+    frame for smooth motion; the smoke brightens with the tube strobe (MPC TubeGlow)."""
+    m = new_material(name)
+    set_first(m, ["blend_mode"], unreal.BlendMode.BLEND_TRANSLUCENT)
+    set_first(m, ["shading_model"], unreal.MaterialShadingModel.MSM_UNLIT)
+    set_first(m, ["two_sided"], True)
+    cols, rows, frames = float(info["cols"]), float(info["rows"]), float(info["frames"])
 
-    thr = p_scalar(m, "Threshold", 0.45, -1000, 300)
-    soft = p_scalar(m, "Softness", 0.07, -1000, 400)
-    lo = node2(m, unreal.MaterialExpressionSubtract, thr, soft, -800, 300)
-    hi = node2(m, unreal.MaterialExpressionAdd, thr, soft, -800, 400)
-    st = expr(m, unreal.MaterialExpressionSmoothStep, -600, 200)
-    mel.connect_material_expressions(lo, "", st, "Min")
-    mel.connect_material_expressions(hi, "", st, "Max")
-    mel.connect_material_expressions(field, "", st, "Value")
-    ext = node2(m, unreal.MaterialExpressionMultiply, st, p_scalar(m, "Density", CLOUD_DENSITY, -600, 400), -400, 250)
+    t = expr(m, unreal.MaterialExpressionCollectionParameter, -2600, 0, collection=mpc, parameter_name="SmokeFrame")
+    tf = node2(m, unreal.MaterialExpressionMultiply, t, p_scalar(m, "Speed", 1.0, -2600, 120), -2400, 40)
+    tf = node2(m, unreal.MaterialExpressionAdd, tf, p_scalar(m, "Offset", 0.0, -2600, 220), -2250, 80)
+    fl = expr(m, unreal.MaterialExpressionFloor, -2100, 0)
+    mel.connect_material_expressions(tf, "", fl, "")
+    blend = node2(m, unreal.MaterialExpressionSubtract, tf, fl, -2000, 200)        # frac -> blend weight
+    uv = expr(m, unreal.MaterialExpressionTextureCoordinate, -2100, 400)
 
-    # Volume domain: Base Color = albedo, Subsurface Color pin = extinction
-    mel.connect_material_property(p_vector(m, "Albedo", (0.82, 0.82, 0.84), -400, -100), "",
-                                  unreal.MaterialProperty.MP_BASE_COLOR)
-    mel.connect_material_property(ext, "", unreal.MaterialProperty.MP_SUBSURFACE_COLOR)
+    def sample(frame_node, y):
+        k = node2(m, unreal.MaterialExpressionFmod, frame_node, const(m, frames, -1900, y + 60), -1750, y)
+        col = node2(m, unreal.MaterialExpressionFmod, k, const(m, cols, -1600, y + 60), -1450, y)
+        row = expr(m, unreal.MaterialExpressionFloor, -1300, y + 100)
+        mel.connect_material_expressions(node2(m, unreal.MaterialExpressionDivide, k, const(m, cols, -1600, y + 160),
+                                               -1450, y + 100), "", row, "")
+        cell = node2(m, unreal.MaterialExpressionAppendVector, col, row, -1150, y)
+        auv = node2(m, unreal.MaterialExpressionAdd, uv, cell, -1000, y)
+        auv = node2(m, unreal.MaterialExpressionDivide, auv,
+                    expr(m, unreal.MaterialExpressionConstant2Vector, -1150, y + 120, r=cols, g=rows), -850, y)
+        ts = expr(m, unreal.MaterialExpressionTextureSample, -650, y, texture=tex)
+        set_first(ts, ["sampler_type"], unreal.MaterialSamplerType.SAMPLERTYPE_COLOR)
+        mel.connect_material_expressions(auv, "", ts, "UVs")
+        return ts
+
+    s0 = sample(fl, -200)
+    nxt = node2(m, unreal.MaterialExpressionAdd, fl, const(m, 1.0, -1900, 500), -1800, 450)
+    s1 = sample(nxt, 450)
+    rgb = expr(m, unreal.MaterialExpressionLinearInterpolate, -350, -100)
+    mel.connect_material_expressions(s0, "RGB", rgb, "A")
+    mel.connect_material_expressions(s1, "RGB", rgb, "B")
+    mel.connect_material_expressions(blend, "", rgb, "Alpha")
+    alpha = expr(m, unreal.MaterialExpressionLinearInterpolate, -350, 150)
+    mel.connect_material_expressions(s0, "A", alpha, "A")
+    mel.connect_material_expressions(s1, "A", alpha, "B")
+    mel.connect_material_expressions(blend, "", alpha, "Alpha")
+
+    bright = node2(m, unreal.MaterialExpressionMultiply, rgb, p_scalar(m, "Brightness", SMOKE_BRIGHTNESS, -350, 0),
+                   -150, -100)
+    glow = expr(m, unreal.MaterialExpressionCollectionParameter, -500, 300, collection=mpc, parameter_name="TubeGlow")
+    glow = node2(m, unreal.MaterialExpressionMultiply, glow, p_scalar(m, "StrobeGlow", SMOKE_STROBE_GLOW, -500, 400),
+                 -300, 330)
+    glow = node2(m, unreal.MaterialExpressionMultiply, glow, alpha, -150, 300)
+    emis = node2(m, unreal.MaterialExpressionAdd, bright, glow, 0, 0)
+    op = node2(m, unreal.MaterialExpressionMultiply, alpha, p_scalar(m, "Opacity", 1.0, -150, 450), 0, 300)
+    mel.connect_material_property(emis, "", unreal.MaterialProperty.MP_EMISSIVE_COLOR)
+    mel.connect_material_property(op, "", unreal.MaterialProperty.MP_OPACITY)
     return finish(m)
 
 
-def cloud_instance(parent, name, half_size, edge_w, threshold=0.45, scale1=600.0, density=None, offset=(0, 0, 0)):
+def smoke_instance(parent, name, offset, speed=1.0, brightness=None):
     path = MAT_DIR + "/" + name
     mi = eal.load_asset(path) if eal.does_asset_exist(path) else asset_tools.create_asset(
         name, MAT_DIR, unreal.MaterialInstanceConstant, unreal.MaterialInstanceConstantFactoryNew())
     mel.set_material_instance_parent(mi, parent)
-    mel.set_material_instance_vector_parameter_value(mi, "HalfSize",
-                                                     unreal.LinearColor(half_size[0], half_size[1], half_size[2], 0))
-    mel.set_material_instance_vector_parameter_value(mi, "EdgeWeights",
-                                                     unreal.LinearColor(edge_w[0], edge_w[1], edge_w[2], 0))
-    mel.set_material_instance_scalar_parameter_value(mi, "Threshold", threshold)
-    mel.set_material_instance_scalar_parameter_value(mi, "Scale1", scale1)
-    mel.set_material_instance_vector_parameter_value(mi, "Offset",
-                                                     unreal.LinearColor(offset[0], offset[1], offset[2], 0))
-    if density is not None:
-        mel.set_material_instance_scalar_parameter_value(mi, "Density", density)
+    mel.set_material_instance_scalar_parameter_value(mi, "Offset", float(offset))
+    mel.set_material_instance_scalar_parameter_value(mi, "Speed", float(speed))
+    if brightness is not None:
+        mel.set_material_instance_scalar_parameter_value(mi, "Brightness", float(brightness))
     mel.update_material_instance(mi)
     eal.save_loaded_asset(mi)
     return mi
+
+
+def make_smoke(mpc):
+    """Import the three flipbook atlases + card mesh, build one material per atlas."""
+    meta = json.load(open(PLATES_JSON))
+    out = {"card": import_card_mesh(), "meta": meta}
+    for key in ("gate", "wall", "floor"):
+        info = meta[key]
+        tex = import_texture(os.path.join(PLATES_DIR, info["file"]), "T_Smoke_" + key.capitalize())
+        out[key] = make_smoke_material("M_Smoke_" + key.capitalize(), tex, info, mpc)
+    return out
 
 
 # --------------------------------------------------------------------------- level + actors
@@ -384,40 +403,39 @@ def build_set(data, logo_mesh, mats):
         actors["logo"] = spawn_mesh(logo_mesh, mats.get("chrome"), data["logo"]["location"], (1, 1, 1),
                                     "SeagmaLogo", (0, 0, LOGO_YAW_FIX))
 
-    vol_master = mats.get("cloud_volume")
+    smoke = mats.get("smoke")
 
-    actors["volumes"] = []
+    def card(label, loc, w_cm, h_cm, mat_key, offset, parent=None, speed=1.0, brightness=None):
+        if smoke is None:
+            return None
+        mi = smoke_instance(smoke[mat_key], "MI_Smoke_" + label, offset, speed, brightness)
+        a = spawn_mesh(smoke["card"], mi, loc, (w_cm / 100.0, 1.0, h_cm / 100.0), label)
+        a.static_mesh_component.set_cast_shadow(False)
+        if parent is not None:
+            a.attach_to_actor(parent, "", unreal.AttachmentRule.KEEP_WORLD, unreal.AttachmentRule.KEEP_WORLD,
+                              unreal.AttachmentRule.KEEP_WORLD, False)
+        return a
 
-    def cloud(label, loc, size, edge_w, threshold=0.45, scale1=600.0, density=None):
-        half = (size[0] / 2.0, size[1] / 2.0, size[2] / 2.0)
-        if vol_master is not None:
-            idx = len(actors["volumes"])
-            a = spawn(unreal.HeterogeneousVolume, loc, label=label)
-            comp = a.get_component_by_class(unreal.HeterogeneousVolumeComponent)
-            set_first(comp, ["pivot_at_centroid", "b_pivot_at_centroid"], True)
-            # Movie Render Queue: wait for the volume data to stream in, otherwise clouds render empty
-            set_first(comp, ["issue_blocking_requests", "b_issue_blocking_requests"], True)
-            set_first(comp, ["playing", "b_playing"], False)      # the sequence drives "Frame"
-            set_first(comp, ["looping", "b_looping"], True)
-            set_first(comp, ["step_factor"], 0.5)                 # finer ray march -> crisper billows
-            set_first(comp, ["shadow_step_factor"], 1.0)
-            set_first(comp, ["cast_shadow"], True)
-            offset = (0.137 * idx, 0.311 * idx, 0.71 * idx)       # decorrelate the elements
-            comp.set_material(0, cloud_instance(vol_master, "MI_Cloud_" + label, half, edge_w, threshold,
-                                                scale1, density, offset))
-            a.set_actor_scale3d(V((size[0] / SVT_RES, size[1] / SVT_RES, size[2] / SVT_RES)))
-            actors["volumes"].append(a)
-            return a
-        # fallback when the VDB could not be imported: solid blocks with the moving-noise surface
-        return spawn_mesh(cube, mats.get("cloud"), loc, (size[0] / 100, size[1] / 100, size[2] / 100), label)
-
-    for name, g in data["gates"].items():
-        actors[name] = cloud(name, (g["x_keys"][0]["x_cm"], g["y_cm"], g["z_cm"]), g["size_cm"], (0.5, 0.5, 0.05))
+    nf = smoke["meta"]["gate"]["frames"] if smoke else 80
+    for i, (name, g) in enumerate(data["gates"].items()):
+        w, d, h = g["size_cm"]
+        x0 = g["x_keys"][0]["x_cm"]
+        # the gate actor is the back smoke layer; a front layer rides along (parallax, depth)
+        back = card(name, (x0, g["y_cm"] - d * 0.25, g["z_cm"]), w, h, "gate", i * 31 % nf)
+        actors[name] = back
+        card(name + "_Front", (x0, g["y_cm"] + d * 0.5, g["z_cm"]), w * 1.04, h, "gate", (i * 31 + 47) % nf, back,
+             1.15, 1.1)
     for i, pl in enumerate(data["pillars"]):
-        cloud("Pillar_%d" % i, pl["location"], pl["size_cm"], (0.5, 0.5, 0.05))
-    cloud("BackWall", data["BackWall"]["location"], data["BackWall"]["size_cm"], (0.02, 0.8, 0.02), 0.45, 900.0)
+        w, d, h = pl["size_cm"]
+        x, y, z = pl["location"]
+        card("Pillar_%d" % i, (x, y + d * 0.5, z), w * 1.3, h, "gate", (i * 19 + 11) % nf, None, 0.9, 0.85)
+    bw = data["BackWall"]
+    card("BackWall", (bw["location"][0], bw["location"][1], 300.0), 2600.0, 1400.0, "wall", 0, None, 0.8, 0.8)
+    card("BackWall_Near", (0.0, bw["location"][1] + 250.0, 250.0), 2700.0, 1450.0, "wall", 37, None, 0.9, 0.65)
     fl = data["CloudFloor"]
-    cloud("CloudFloor", fl["location"], fl["size_cm"], (0.02, 0.02, 0.9), 0.36, 700.0, CLOUD_DENSITY * 0.6)
+    floor_z = fl["location"][2] - fl["size_cm"][2] / 2.0
+    card("CloudFloor", (0.0, 250.0, floor_z + 200.0), 4600.0, 400.0, "floor", 0, None, 1.0, 1.1)
+    card("CloudFloor_Back", (0.0, -350.0, floor_z + 230.0), 4600.0, 460.0, "floor", 29, None, 0.85, 0.9)
 
     # dark ground under the smoke
     ground_z = fl["location"][2] - fl["size_cm"][2] / 2.0
@@ -676,9 +694,8 @@ def animate_sequence(seq, data, actors):
     tube_lights = actors.get("tube_lights", [])
     if glow and tube_lights:
         stage("sequence: tube light strobe (fog glow)", key_tube_lights, seq, tube_lights, glow, end)
-    vols = actors.get("volumes", [])
-    if vols:
-        stage("sequence: smoke frames", key_volume_frames, seq, vols, end, actors.get("smoke_frames", 1))
+    if actors.get("mpc") is not None:
+        stage("sequence: smoke flipbook time (MPC SmokeFrame)", key_smoke_time, seq, actors["mpc"], end)
     stage("sequence: fade in", key_fade, seq, data, end)
 
     eal.save_loaded_asset(seq)
@@ -723,8 +740,9 @@ def key_gates(data, gate_actors, gate_b, end):
     for (name, g), b, a in zip(gates, gate_b, gate_actors):
         ch = transform_section(b, end)
         scale = a.get_actor_scale3d()
+        loc = a.get_actor_location()
         for k in g["x_keys"]:
-            key_transform(ch, k["frame"], (k["x_cm"], g["y_cm"], g["z_cm"]), (0, 0, 0),
+            key_transform(ch, k["frame"], (k["x_cm"], loc.y, loc.z), (0, 0, 0),
                           (scale.x, scale.y, scale.z))
 
 
@@ -769,31 +787,20 @@ def key_tube_lights(seq, tube_lights, glow, end):
             add_key(ch, f, float(v) * TUBE_LIGHT_LUMENS, unreal.MovieSceneKeyInterpolation.CONSTANT)
 
 
-def key_volume_frames(seq, vols, end, n_frames):
-    """Play the looping smoke sim: Frame = (offset + t * SMOKE_SPEED) mod n_frames.
-    Linear keys between loop points, constant key on the last frame before each wrap."""
-    n = float(max(1, n_frames))
-    for i, (b, a) in enumerate(zip(bind(vols), vols)):
-        comp = a.get_component_by_class(unreal.HeterogeneousVolumeComponent)
-        cb = component_binding(seq, b, a, comp)
-        tr = cb.add_track(unreal.MovieSceneFloatTrack)
-        tr.set_property_name_and_path("Frame", "Frame")
-        sec = tr.add_section()
-        sec.set_range(0, end)
-        ch = double_channels(sec)[0]
-        val = (i * 37.0) % n
-        add_key(ch, 1, val, unreal.MovieSceneKeyInterpolation.LINEAR)
-        f = 1
-        while f <= end:
-            steps = int((n - 1e-3 - val) / SMOKE_SPEED)         # whole frames before passing the loop end
-            last = min(end + 1, f + max(steps, 0))
-            v_last = val + (last - f) * SMOKE_SPEED
-            add_key(ch, last, v_last, unreal.MovieSceneKeyInterpolation.CONSTANT)
-            if last >= end + 1:
-                break
-            f = last + 1
-            val = v_last + SMOKE_SPEED - n                       # wrap to the start of the loop
-            add_key(ch, f, val, unreal.MovieSceneKeyInterpolation.LINEAR)
+def key_smoke_time(seq, mpc, end):
+    """SmokeFrame runs linearly 0 -> end * SMOKE_SPEED; each material wraps it with its own offset."""
+    track = seq.add_track(unreal.MovieSceneMaterialParameterCollectionTrack)
+    track.set_editor_property("mpc", mpc)
+    sec = track.add_section()
+    sec.set_range(0, end)
+    sec.add_scalar_parameter_key("SmokeFrame", F(1), 0.0)
+    sec.add_scalar_parameter_key("SmokeFrame", F(end + 1), float(end) * SMOKE_SPEED)
+    try:
+        for ch in sec.get_all_channels():
+            for k in ch.get_keys():
+                k.set_interpolation_mode(unreal.RichCurveInterpMode.RCIM_LINEAR)
+    except Exception:
+        pass
 
 
 def set_constant_interp(section):
@@ -828,11 +835,10 @@ def make_materials():
         m = stage("material " + key, fn)
         if m is not None:
             mats[key] = m
-    svt = stage("import cloud VDB -> Sparse Volume Texture", import_cloud_svt)
-    if svt is not None:
-        vm = stage("material cloud volume (Heterogeneous Volume)", make_cloud_volume_material, svt)
-        if vm is not None:
-            mats["cloud_volume"] = vm
+    if mpc is not None:
+        sm = stage("smoke flipbooks (textures + card + materials)", make_smoke, mpc)
+        if sm is not None:
+            mats["smoke"] = sm
     return mats
 
 
@@ -881,9 +887,6 @@ def main():
         stage("open/create level " + MAP_PATH, open_or_create_level)
         actors = stage("spawn set actors", build_set, data, logo_mesh, mats) or {}
         actors["mpc"] = mats.get("mpc")
-        smoke_dir = os.path.dirname(CLOUD_VDB)
-        actors["smoke_frames"] = len([f for f in os.listdir(smoke_dir) if f.endswith(".vdb")]) \
-            if os.path.isdir(smoke_dir) else 1
         task.enter_progress_frame(1, "Animating Level Sequence")
         if seq is not None:
             stage("animate sequence", animate_sequence, seq, data, actors)
