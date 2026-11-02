@@ -17,3 +17,4 @@ DerivedDataCache/
 *.suo
 *.xcworkspace
 .mcp.json
+__pycache__/
