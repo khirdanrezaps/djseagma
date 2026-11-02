@@ -22,6 +22,7 @@ the sequence.
 """
 import json
 import os
+import traceback
 
 import unreal
 
@@ -52,6 +53,22 @@ seq_sub = unreal.get_editor_subsystem(unreal.LevelSequenceEditorSubsystem)
 
 def log(msg):
     unreal.log("[SeagmaAnim] " + msg)
+
+
+RESULTS = []   # (stage, ok, error) - shown in a popup at the end
+
+
+def stage(name, fn, *args):
+    """Run one step; an error is logged and reported but never stops the next steps."""
+    try:
+        out = fn(*args)
+        RESULTS.append((name, True, ""))
+        log("OK   " + name)
+        return out
+    except Exception as exc:
+        RESULTS.append((name, False, "%s: %s" % (type(exc).__name__, exc)))
+        unreal.log_error("[SeagmaAnim] FAILED %s\n%s" % (name, traceback.format_exc()))
+        return None
 
 
 # --------------------------------------------------------------------------- import
@@ -204,30 +221,43 @@ def build_set(data, logo_mesh, mats):
     cyl = eal.load_asset("/Engine/BasicShapes/Cylinder")       # 100 cm tall, 100 cm wide
     actors = {}
 
-    actors["logo"] = spawn_mesh(logo_mesh, mats["chrome"], data["logo"]["location"], (1, 1, 1),
-                                "SeagmaLogo", (0, 0, LOGO_YAW_FIX))
+    if logo_mesh is not None:
+        actors["logo"] = spawn_mesh(logo_mesh, mats.get("chrome"), data["logo"]["location"], (1, 1, 1),
+                                    "SeagmaLogo", (0, 0, LOGO_YAW_FIX))
 
     for name, g in data["gates"].items():
         k0 = g["x_keys"][0]["x_cm"]
         s = g["size_cm"]
-        actors[name] = spawn_mesh(cube, mats["cloud"], (k0, g["y_cm"], g["z_cm"]),
+        actors[name] = spawn_mesh(cube, mats.get("cloud"), (k0, g["y_cm"], g["z_cm"]),
                                   (s[0] / 100, s[1] / 100, s[2] / 100), name)
 
     for i, p in enumerate(data["pillars"]):
         s = p["size_cm"]
-        spawn_mesh(cube, mats["cloud"], p["location"], (s[0] / 100, s[1] / 100, s[2] / 100), "Pillar_%d" % i)
+        spawn_mesh(cube, mats.get("cloud"), p["location"], (s[0] / 100, s[1] / 100, s[2] / 100), "Pillar_%d" % i)
     for key in ("BackWall", "CloudFloor"):
         s = data[key]["size_cm"]
-        spawn_mesh(cube, mats["cloud"], data[key]["location"], (s[0] / 100, s[1] / 100, s[2] / 100), key)
+        spawn_mesh(cube, mats.get("cloud"), data[key]["location"], (s[0] / 100, s[1] / 100, s[2] / 100), key)
 
     actors["tubes"] = []
     for t in data["light_tubes"]:
-        a = spawn_mesh(cyl, mats["tube"], t["location"], (0.1, 0.1, t["length_cm"] / 100), t["name"])
+        a = spawn_mesh(cyl, mats.get("tube"), t["location"], (0.1, 0.1, t["length_cm"] / 100), t["name"])
         a.static_mesh_component.set_cast_shadow(False)
         actors["tubes"].append((a, t))
     for i, w in enumerate(data["wires"]):
-        spawn_mesh(cyl, mats["wire"], w["location"], (0.016, 0.016, w["length_cm"] / 100), "Wire_%02d" % i)
+        spawn_mesh(cyl, mats.get("wire"), w["location"], (0.016, 0.016, w["length_cm"] / 100), "Wire_%02d" % i)
 
+    stage("lights + fog", build_lights)
+
+    # Cine camera - lens/filmback matching Blender (35 mm on a 36 mm sensor, f/8)
+    cam_data = data["camera"]
+    k0 = cam_data["keys"][0]
+    cam = spawn(unreal.CineCameraActor, k0["location"], (k0["roll"], k0["pitch"], k0["yaw"]), "SEAGMA_Cam")
+    actors["camera"] = cam
+    stage("camera lens settings", setup_lens, cam, cam_data, k0)
+    return actors
+
+
+def build_lights():
     # Lights (same layout idea as the Blender scene: soft top key, front fill, skylight)
     key = spawn(unreal.RectLight, (0, 300, 1700), (0, -78, 90), "Key_Top")
     kc = key.get_component_by_class(unreal.RectLightComponent)
@@ -258,10 +288,9 @@ def build_set(data, logo_mesh, mats):
     fogc.set_editor_property("volumetric_fog", True)
     fogc.set_editor_property("volumetric_fog_extinction_scale", 2.0)
 
-    # Cine camera - lens/filmback matching Blender (35 mm on a 36 mm sensor, f/8)
-    cam_data = data["camera"]
-    k0 = cam_data["keys"][0]
-    cam = spawn(unreal.CineCameraActor, k0["location"], (k0["roll"], k0["pitch"], k0["yaw"]), "SEAGMA_Cam")
+
+
+def setup_lens(cam, cam_data, k0):
     cc = cam.get_cine_camera_component()
     fb = cc.filmback
     fb.sensor_width = cam_data["sensor_mm"]
@@ -273,8 +302,6 @@ def build_set(data, logo_mesh, mats):
     fs.focus_method = unreal.CameraFocusMethod.MANUAL
     fs.manual_focus_distance = k0["focus_cm"]
     cc.focus_settings = fs
-    actors["camera"] = cam
-    return actors
 
 
 # --------------------------------------------------------------------------- sequence helpers
@@ -324,73 +351,120 @@ def get_binding_id(seq, binding):
 
 
 # --------------------------------------------------------------------------- sequence
-def build_sequence(data, actors):
+def create_sequence(data):
+    """Create + save the Level Sequence asset first, so it exists even if a later step fails."""
     path = SEQ_DIR + "/" + SEQ_NAME
-    if eal.does_asset_exist(path):
+    try:
         unreal.LevelSequenceEditorBlueprintLibrary.close_level_sequence()
+    except Exception:
+        pass
+    if eal.does_asset_exist(path):
         eal.delete_asset(path)
+    if not eal.does_directory_exist(SEQ_DIR):
+        eal.make_directory(SEQ_DIR)
     seq = asset_tools.create_asset(SEQ_NAME, SEQ_DIR, unreal.LevelSequence, unreal.LevelSequenceFactoryNew())
+    if seq is None:
+        raise RuntimeError("AssetTools.create_asset returned None for " + path)
 
     fps = int(data["fps"])
     end = int(data["frame_end"])                     # Blender 1..1080 -> Sequencer 0..1080 (end exclusive)
     seq.set_display_rate(unreal.FrameRate(fps, 1))
     seq.set_playback_start(0)
     seq.set_playback_end(end)
-    seq.set_view_range_start(0.0)
-    seq.set_view_range_end(end / float(fps))
-    seq.set_work_range_start(0.0)
-    seq.set_work_range_end(end / float(fps))
+    for fn, val in (("set_view_range_start", 0.0), ("set_view_range_end", end / float(fps)),
+                    ("set_work_range_start", 0.0), ("set_work_range_end", end / float(fps))):
+        try:
+            getattr(seq, fn)(val)
+        except Exception:
+            pass
+    eal.save_asset(path, only_if_is_dirty=False)
+    log("sequence asset created: " + path)
+    return seq
 
-    # Bindings are created through LevelSequenceEditorSubsystem on the open sequence
+
+def bind(actors_list):
+    """Bind actors through LevelSequenceEditorSubsystem; fall back to add_possessable per actor."""
+    try:
+        bindings = seq_sub.add_actors(actors_list)
+        if bindings and len(bindings) == len(actors_list):
+            return list(bindings)
+        unreal.log_warning("[SeagmaAnim] add_actors returned %d bindings for %d actors, falling back"
+                           % (len(bindings or []), len(actors_list)))
+    except Exception as exc:
+        unreal.log_warning("[SeagmaAnim] add_actors failed (%s), falling back" % exc)
+    seq = unreal.LevelSequenceEditorBlueprintLibrary.get_current_level_sequence()
+    return [seq.add_possessable(a) for a in actors_list]
+
+
+def animate_sequence(seq, data, actors):
+    fps = int(data["fps"])
+    end = int(data["frame_end"])
     unreal.LevelSequenceEditorBlueprintLibrary.open_level_sequence(seq)
-    cam = actors["camera"]
-    gate_actors = [actors[n] for n in data["gates"]]
-    tube_actors = [a for a, _ in actors["tubes"]]
-    bindings = seq_sub.add_actors([cam] + gate_actors + tube_actors)
-    cam_b = bindings[0]
-    gate_b = bindings[1:1 + len(gate_actors)]
-    tube_b = bindings[1 + len(gate_actors):]
 
-    # Camera move (bezier/auto tangents like the Blender keys)
+    cam = actors.get("camera")
+    gate_actors = [actors[n] for n in data["gates"] if n in actors]
+    tubes = actors.get("tubes", [])
+
+    if cam is not None:
+        cam_b = bind([cam])[0]
+        stage("sequence: camera move", key_camera, data, cam_b, end)
+        stage("sequence: focus distance", key_focus, seq, data, cam, cam_b, end)
+        stage("sequence: camera cut", camera_cut, seq, cam_b, end)
+    if gate_actors:
+        stage("sequence: gates open", key_gates, data, gate_actors, bind(gate_actors), end)
+    if tubes:
+        stage("sequence: light tube strobes", key_tubes, tubes, bind([a for a, _ in tubes]), end)
+    stage("sequence: fade in", key_fade, seq, data, end)
+
+    eal.save_loaded_asset(seq)
+    try:
+        unreal.LevelSequenceEditorBlueprintLibrary.refresh_current_level_sequence()
+    except Exception:
+        pass
+
+
+def key_camera(data, cam_b, end):
     ch = transform_section(cam_b, end)
     for k in data["camera"]["keys"]:
         key_transform(ch, k["frame"], k["location"], (k["roll"], k["pitch"], k["yaw"]), (1, 1, 1))
 
-    # Focus distance on the CineCameraComponent
-    try:
-        comp_b = None
-        for child in cam_b.get_child_possessables():
-            if "Camera" in str(child.get_display_name()):
-                comp_b = child
-                break
-        if comp_b is None:
-            comp_b = seq.add_possessable(cam.get_cine_camera_component())
-        ftrack = comp_b.add_track(unreal.MovieSceneFloatTrack)
-        ftrack.set_property_name_and_path("ManualFocusDistance", "FocusSettings.ManualFocusDistance")
-        fsec = ftrack.add_section()
-        fsec.set_range(0, end)
-        fch = double_channels(fsec)[0]
-        for k in data["camera"]["keys"]:
-            add_key(fch, k["frame"], float(k["focus_cm"]))
-    except Exception as exc:
-        unreal.log_warning("[SeagmaAnim] focus track skipped: %s" % exc)
 
-    # Camera cut
+def key_focus(seq, data, cam, cam_b, end):
+    comp_b = None
+    for child in cam_b.get_child_possessables():
+        if "Camera" in str(child.get_display_name()):
+            comp_b = child
+            break
+    if comp_b is None:
+        comp_b = seq.add_possessable(cam.get_cine_camera_component())
+    ftrack = comp_b.add_track(unreal.MovieSceneFloatTrack)
+    ftrack.set_property_name_and_path("ManualFocusDistance", "FocusSettings.ManualFocusDistance")
+    fsec = ftrack.add_section()
+    fsec.set_range(0, end)
+    fch = double_channels(fsec)[0]
+    for k in data["camera"]["keys"]:
+        add_key(fch, k["frame"], float(k["focus_cm"]))
+
+
+def camera_cut(seq, cam_b, end):
     cut = seq.add_track(unreal.MovieSceneCameraCutTrack)
     cut_sec = cut.add_section()
     cut_sec.set_range(0, end)
     cut_sec.set_camera_binding_id(get_binding_id(seq, cam_b))
 
-    # Gates slide open (hold closed, then ease open)
-    for (name, g), b, a in zip(data["gates"].items(), gate_b, gate_actors):
+
+def key_gates(data, gate_actors, gate_b, end):
+    gates = [(n, g) for n, g in data["gates"].items()]
+    for (name, g), b, a in zip(gates, gate_b, gate_actors):
         ch = transform_section(b, end)
         scale = a.get_actor_scale3d()
         for k in g["x_keys"]:
             key_transform(ch, k["frame"], (k["x_cm"], g["y_cm"], g["z_cm"]), (0, 0, 0),
                           (scale.x, scale.y, scale.z))
 
-    # Light tube strobes: visibility on/off with the exact beat pattern from Blender
-    for b, (a, t) in zip(tube_b, actors["tubes"]):
+
+def key_tubes(tubes, tube_b, end):
+    for b, (a, t) in zip(tube_b, tubes):
         vtrack = b.add_track(unreal.MovieSceneVisibilityTrack)
         vtrack.set_property_name_and_path("bHidden", "bHidden")
         vsec = vtrack.add_section()
@@ -402,7 +476,8 @@ def build_sequence(data, actors):
                 continue
             vch.add_key(F(frame), not (glow > 0.0), 0.0, unreal.MovieSceneTimeUnit.DISPLAY_RATE)
 
-    # Fade in from black (0-4 s)
+
+def key_fade(seq, data, end):
     fade = seq.add_track(unreal.MovieSceneFadeTrack)
     fsec = fade.add_section()
     fsec.set_range(0, end)
@@ -410,35 +485,67 @@ def build_sequence(data, actors):
     add_key(fch, data["fade_in"]["from_frame"], 1.0)
     add_key(fch, data["fade_in"]["to_frame"], 0.0)
 
-    eal.save_loaded_asset(seq)
-    unreal.LevelSequenceEditorBlueprintLibrary.refresh_current_level_sequence()
-    log("sequence ready: " + seq.get_path_name())
-    return seq
-
 
 # --------------------------------------------------------------------------- main
+def make_materials():
+    mats = {}
+    for key, fn in (("chrome", make_chrome), ("cloud", make_cloud), ("tube", make_tube), ("wire", make_wire)):
+        m = stage("material " + key, fn)
+        if m is not None:
+            mats[key] = m
+    return mats
+
+
+def assign_logo_material(logo_mesh, mats):
+    logo_mesh.set_material(0, mats["chrome"])
+    eal.save_loaded_asset(logo_mesh)
+
+
+def report():
+    lines = [("OK      " if ok else "GAGAL   ") + name + ("" if ok else "\n          " + err)
+             for name, ok, err in RESULTS]
+    failed = [r for r in RESULTS if not r[1]]
+    summary = "\n".join(lines)
+    log("summary:\n" + summary)
+    head = ("Semua langkah berhasil.\n" if not failed else
+            "%d langkah gagal - detail lengkap ada di Output Log (cari [SeagmaAnim]).\n" % len(failed))
+    head += "Sequence: %s/%s\n\n" % (SEQ_DIR, SEQ_NAME)
+    try:
+        unreal.EditorDialog.show_message("DJ Seagma - import_and_animate", head + summary,
+                                         unreal.AppMsgType.OK)
+    except Exception:
+        pass
+
+
 def main():
     if not os.path.isfile(DATA_JSON) or not os.path.isfile(LOGO_FBX):
-        raise RuntimeError("SourceAssets missing - expected %s and %s" % (LOGO_FBX, DATA_JSON))
+        unreal.EditorDialog.show_message(
+            "DJ Seagma", "SourceAssets tidak ditemukan:\n%s\n%s\n\nPastikan sudah git pull dan "
+            "folder SourceAssets ada di sebelah DJSeagma_Anim.uproject." % (LOGO_FBX, DATA_JSON),
+            unreal.AppMsgType.OK)
+        return
     with open(DATA_JSON, "r") as fh:
         data = json.load(fh)
 
-    with unreal.ScopedSlowTask(5, "DJ Seagma: building logo animation") as task:
+    with unreal.ScopedSlowTask(6, "DJ Seagma: building logo animation") as task:
         task.make_dialog(True)
+        task.enter_progress_frame(1, "Creating Level Sequence asset")
+        seq = stage("create Level Sequence asset", create_sequence, data)
         task.enter_progress_frame(1, "Importing logo FBX")
-        logo_mesh = import_logo()
+        logo_mesh = stage("import logo FBX", import_logo)
         task.enter_progress_frame(1, "Creating materials")
-        mats = {"chrome": make_chrome(), "cloud": make_cloud(), "tube": make_tube(), "wire": make_wire()}
-        logo_mesh.set_material(0, mats["chrome"])
-        eal.save_loaded_asset(logo_mesh)
+        mats = make_materials()
+        if logo_mesh is not None and "chrome" in mats:
+            stage("assign chrome to logo", assign_logo_material, logo_mesh, mats)
         task.enter_progress_frame(1, "Building level")
-        open_or_create_level()
-        actors = build_set(data, logo_mesh, mats)
-        task.enter_progress_frame(1, "Creating Level Sequence")
-        build_sequence(data, actors)
+        stage("open/create level " + MAP_PATH, open_or_create_level)
+        actors = stage("spawn set actors", build_set, data, logo_mesh, mats) or {}
+        task.enter_progress_frame(1, "Animating Level Sequence")
+        if seq is not None:
+            stage("animate sequence", animate_sequence, seq, data, actors)
         task.enter_progress_frame(1, "Saving")
-        level_sub.save_current_level()
-    log("done - open %s/%s and press Play in Sequencer" % (SEQ_DIR, SEQ_NAME))
+        stage("save level", level_sub.save_current_level)
+    report()
 
 
 main()
