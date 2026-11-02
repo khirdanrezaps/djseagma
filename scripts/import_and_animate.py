@@ -246,7 +246,8 @@ def build_set(data, logo_mesh, mats):
     for i, w in enumerate(data["wires"]):
         spawn_mesh(cyl, mats.get("wire"), w["location"], (0.016, 0.016, w["length_cm"] / 100), "Wire_%02d" % i)
 
-    stage("lights + fog", build_lights)
+    stage("lights", build_lights)
+    stage("smoke fog", build_fog)
 
     # Cine camera - lens/filmback matching Blender (35 mm on a 36 mm sensor, f/8)
     cam_data = data["camera"]
@@ -281,12 +282,27 @@ def build_lights():
     sc.set_editor_property("real_time_capture", True)
     sc.set_intensity(0.15)
 
+
+
+def set_first(obj, names, value):
+    """Set the first property name that exists (names differ between engine versions)."""
+    for n in names:
+        try:
+            obj.set_editor_property(n, value)
+            return n
+        except Exception:
+            continue
+    unreal.log_warning("[SeagmaAnim] none of %s found on %s" % (names, obj.get_class().get_name()))
+    return None
+
+
+def build_fog():
     fog = spawn(unreal.ExponentialHeightFog, (0, 0, -400), label="SmokeFog")
     fogc = fog.get_component_by_class(unreal.ExponentialHeightFogComponent)
-    fogc.set_editor_property("fog_density", 0.03)
-    fogc.set_editor_property("fog_height_falloff", 0.6)
-    fogc.set_editor_property("volumetric_fog", True)
-    fogc.set_editor_property("volumetric_fog_extinction_scale", 2.0)
+    set_first(fogc, ["fog_density"], 0.03)
+    set_first(fogc, ["fog_height_falloff"], 0.6)
+    set_first(fogc, ["enable_volumetric_fog", "volumetric_fog", "b_enable_volumetric_fog"], True)
+    set_first(fogc, ["volumetric_fog_extinction_scale"], 2.0)
 
 
 
