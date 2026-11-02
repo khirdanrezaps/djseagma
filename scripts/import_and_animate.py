@@ -38,9 +38,22 @@ TAG = "SeagmaAnim"
 # If the imported logo faces the wrong way or reads mirrored, adjust this (degrees, Z axis).
 LOGO_YAW_FIX = 0.0
 
+# ---- look tuning (change these, then re-run the script) ----
+EXPOSURE_BIAS = 0.0         # +1 = twice as bright, -1 = half
+KEY_LUMENS = 900.0          # soft top light on the clouds
+FILL_LUMENS = 120.0         # front fill (keeps the cloud faces readable)
+TUBE_EMISSIVE = 4.0         # brightness of a lit tube (bloom does the rest)
+TUBE_LIGHT_LUMENS = 60.0    # light each lit tube throws into the fog
+TUBE_FOG_SCATTER = 6.0      # how much the tube lights glow inside the volumetric fog
+SATURATION = 0.12           # reference is almost black & white
+CLOUD_DENSITY = 0.35        # extinction per cm inside the cloud
+
 PROJECT_DIR = unreal.Paths.convert_relative_path_to_full(unreal.Paths.project_dir())
 SRC_DIR = os.path.join(PROJECT_DIR, "SourceAssets")
 LOGO_FBX = os.path.join(SRC_DIR, "SM_SeagmaLogo.fbx")
+CLOUD_VDB = os.path.join(SRC_DIR, "VDB", "T_SeagmaCloudNoise.vdb")
+VDB_DIR = ROOT + "/Volumes"
+SVT_RES = 128.0             # voxels per side in the VDB (1 voxel = 1 unit before actor scale)
 DATA_JSON = os.path.join(SRC_DIR, "seagma_anim_data.json")
 
 asset_tools = unreal.AssetToolsHelpers.get_asset_tools()
@@ -170,7 +183,8 @@ def make_cloud():
 def make_tube():
     m = new_material("M_Seagma_LightTube")
     mel.connect_material_property(color(m, (0.02, 0.02, 0.02), -400, -200), "", unreal.MaterialProperty.MP_BASE_COLOR)
-    mel.connect_material_property(color(m, (40.0, 38.8, 37.2), -400, 0), "", unreal.MaterialProperty.MP_EMISSIVE_COLOR)
+    mel.connect_material_property(color(m, (TUBE_EMISSIVE, TUBE_EMISSIVE * 0.97, TUBE_EMISSIVE * 0.93), -400, 0), "",
+                                  unreal.MaterialProperty.MP_EMISSIVE_COLOR)
     return finish(m)
 
 
@@ -180,6 +194,130 @@ def make_wire():
     mel.connect_material_property(const(m, 1.0, -400, 0), "", unreal.MaterialProperty.MP_METALLIC)
     mel.connect_material_property(const(m, 0.4, -400, 100), "", unreal.MaterialProperty.MP_ROUGHNESS)
     return finish(m)
+
+
+def make_ground():
+    m = new_material("M_Seagma_Ground")
+    mel.connect_material_property(color(m, (0.015, 0.015, 0.016), -400, -200), "", unreal.MaterialProperty.MP_BASE_COLOR)
+    mel.connect_material_property(const(m, 0.85, -400, 0), "", unreal.MaterialProperty.MP_ROUGHNESS)
+    return finish(m)
+
+
+# --------------------------------------------------------------------------- heterogeneous volume clouds
+def import_cloud_svt():
+    """OpenVDB -> Sparse Volume Texture."""
+    task = unreal.AssetImportTask()
+    task.filename = CLOUD_VDB
+    task.destination_path = VDB_DIR
+    task.automated = True
+    task.replace_existing = True
+    task.save = True
+    asset_tools.import_asset_tasks([task])
+    svt_cls = getattr(unreal, "SparseVolumeTexture", None)
+    candidates = list(task.imported_object_paths or []) + [VDB_DIR + "/T_SeagmaCloudNoise"]
+    for path in candidates:
+        obj = eal.load_asset(path)
+        if obj is not None and (svt_cls is None or isinstance(obj, svt_cls)):
+            log("cloud SVT: " + obj.get_path_name())
+            return obj
+    raise RuntimeError("VDB import produced no SparseVolumeTexture (%s)" % CLOUD_VDB)
+
+
+def p_scalar(m, name, value, x, y):
+    return expr(m, unreal.MaterialExpressionScalarParameter, x, y, parameter_name=name, default_value=value)
+
+
+def p_vector(m, name, rgb, x, y):
+    return expr(m, unreal.MaterialExpressionVectorParameter, x, y, parameter_name=name,
+                default_value=unreal.LinearColor(rgb[0], rgb[1], rgb[2], 0.0))
+
+
+def node2(m, cls, a, b, x, y, ia="A", ib="B"):
+    n = expr(m, cls, x, y)
+    mel.connect_material_expressions(a, "", n, ia)
+    mel.connect_material_expressions(b, "", n, ib)
+    return n
+
+
+def make_cloud_volume_material(svt):
+    """Volume-domain master material for Heterogeneous Volumes.
+
+    density = smoothstep(lerp(SVT(p/Scale1 + t*Flow1), SVT(p/Scale2 + t*Flow2), 0.35)
+                         - dot((p/HalfSize)^2, EdgeWeights))
+    p is measured from the actor pivot, so the clouds travel with the gates.
+    """
+    m = new_material("M_Seagma_CloudVolume")
+    set_first(m, ["material_domain"], unreal.MaterialDomain.MD_VOLUME)
+    set_first(m, ["blend_mode"], unreal.BlendMode.BLEND_ADDITIVE)
+    set_first(m, ["used_with_heterogeneous_volumes", "b_used_with_heterogeneous_volumes"], True)
+
+    wp = expr(m, unreal.MaterialExpressionWorldPosition, -2400, 0)
+    op = expr(m, unreal.MaterialExpressionObjectPositionWS, -2400, 150)
+    p = node2(m, unreal.MaterialExpressionSubtract, wp, op, -2200, 50)
+    t = expr(m, unreal.MaterialExpressionTime, -2400, 400)
+
+    def octave(scale_name, scale, flow_name, flow, y):
+        inv = node2(m, unreal.MaterialExpressionDivide, p, p_scalar(m, scale_name, scale, -2200, y), -2000, y)
+        mv = node2(m, unreal.MaterialExpressionMultiply, t, p_vector(m, flow_name, flow, -2200, y + 100),
+                   -2000, y + 100)
+        uvw = node2(m, unreal.MaterialExpressionAdd, inv, mv, -1800, y)
+        fr = expr(m, unreal.MaterialExpressionFrac, -1650, y)
+        mel.connect_material_expressions(uvw, "", fr, "")
+        smp = expr(m, unreal.MaterialExpressionSparseVolumeTextureSample, -1450, y)
+        set_first(smp, ["sparse_volume_texture"], svt)
+        mel.connect_material_expressions(fr, "", smp, "UVW")
+        mask = expr(m, unreal.MaterialExpressionComponentMask, -1200, y, r=True, g=False, b=False, a=False)
+        mel.connect_material_expressions(smp, "", mask, "")
+        return mask
+
+    o1 = octave("Scale1", 600.0, "Flow1", (0.015, 0.0, 0.03), -300)
+    o2 = octave("Scale2", 240.0, "Flow2", (-0.02, 0.01, 0.05), 200)
+    mix = expr(m, unreal.MaterialExpressionLinearInterpolate, -1000, -50)
+    mel.connect_material_expressions(o1, "", mix, "A")
+    mel.connect_material_expressions(o2, "", mix, "B")
+    mel.connect_material_expressions(const(m, 0.35, -1200, 50), "", mix, "Alpha")
+
+    # rounded-box erosion towards the volume faces
+    rel = node2(m, unreal.MaterialExpressionDivide, p, p_vector(m, "HalfSize", (380.0, 150.0, 900.0), -2200, 700),
+                -2000, 650)
+    sq = node2(m, unreal.MaterialExpressionMultiply, rel, rel, -1800, 650)
+    edge = node2(m, unreal.MaterialExpressionDotProduct, sq, p_vector(m, "EdgeWeights", (0.5, 0.5, 0.05),
+                                                                      -1800, 800), -1600, 700)
+    field = node2(m, unreal.MaterialExpressionSubtract, mix, edge, -800, 100)
+
+    thr = p_scalar(m, "Threshold", 0.46, -1000, 300)
+    soft = p_scalar(m, "Softness", 0.04, -1000, 400)
+    lo = node2(m, unreal.MaterialExpressionSubtract, thr, soft, -800, 300)
+    hi = node2(m, unreal.MaterialExpressionAdd, thr, soft, -800, 400)
+    st = expr(m, unreal.MaterialExpressionSmoothStep, -600, 200)
+    mel.connect_material_expressions(lo, "", st, "Min")
+    mel.connect_material_expressions(hi, "", st, "Max")
+    mel.connect_material_expressions(field, "", st, "Value")
+    ext = node2(m, unreal.MaterialExpressionMultiply, st, p_scalar(m, "Density", CLOUD_DENSITY, -600, 400), -400, 250)
+
+    # Volume domain: Base Color = albedo, Subsurface Color pin = extinction
+    mel.connect_material_property(p_vector(m, "Albedo", (0.82, 0.82, 0.84), -400, -100), "",
+                                  unreal.MaterialProperty.MP_BASE_COLOR)
+    mel.connect_material_property(ext, "", unreal.MaterialProperty.MP_SUBSURFACE_COLOR)
+    return finish(m)
+
+
+def cloud_instance(parent, name, half_size, edge_w, threshold=0.46, scale1=600.0, density=None):
+    path = MAT_DIR + "/" + name
+    mi = eal.load_asset(path) if eal.does_asset_exist(path) else asset_tools.create_asset(
+        name, MAT_DIR, unreal.MaterialInstanceConstant, unreal.MaterialInstanceConstantFactoryNew())
+    mel.set_material_instance_parent(mi, parent)
+    mel.set_material_instance_vector_parameter_value(mi, "HalfSize",
+                                                     unreal.LinearColor(half_size[0], half_size[1], half_size[2], 0))
+    mel.set_material_instance_vector_parameter_value(mi, "EdgeWeights",
+                                                     unreal.LinearColor(edge_w[0], edge_w[1], edge_w[2], 0))
+    mel.set_material_instance_scalar_parameter_value(mi, "Threshold", threshold)
+    mel.set_material_instance_scalar_parameter_value(mi, "Scale1", scale1)
+    if density is not None:
+        mel.set_material_instance_scalar_parameter_value(mi, "Density", density)
+    mel.update_material_instance(mi)
+    eal.save_loaded_asset(mi)
+    return mi
 
 
 # --------------------------------------------------------------------------- level + actors
@@ -225,29 +363,47 @@ def build_set(data, logo_mesh, mats):
         actors["logo"] = spawn_mesh(logo_mesh, mats.get("chrome"), data["logo"]["location"], (1, 1, 1),
                                     "SeagmaLogo", (0, 0, LOGO_YAW_FIX))
 
-    for name, g in data["gates"].items():
-        k0 = g["x_keys"][0]["x_cm"]
-        s = g["size_cm"]
-        actors[name] = spawn_mesh(cube, mats.get("cloud"), (k0, g["y_cm"], g["z_cm"]),
-                                  (s[0] / 100, s[1] / 100, s[2] / 100), name)
+    vol_master = mats.get("cloud_volume")
 
-    for i, p in enumerate(data["pillars"]):
-        s = p["size_cm"]
-        spawn_mesh(cube, mats.get("cloud"), p["location"], (s[0] / 100, s[1] / 100, s[2] / 100), "Pillar_%d" % i)
-    for key in ("BackWall", "CloudFloor"):
-        s = data[key]["size_cm"]
-        spawn_mesh(cube, mats.get("cloud"), data[key]["location"], (s[0] / 100, s[1] / 100, s[2] / 100), key)
+    def cloud(label, loc, size, edge_w, threshold=0.46, scale1=600.0, density=None):
+        half = (size[0] / 2.0, size[1] / 2.0, size[2] / 2.0)
+        if vol_master is not None:
+            a = spawn(unreal.HeterogeneousVolume, loc, label=label)
+            comp = a.get_component_by_class(unreal.HeterogeneousVolumeComponent)
+            set_first(comp, ["pivot_at_centroid", "b_pivot_at_centroid"], True)
+            comp.set_material(0, cloud_instance(vol_master, "MI_Cloud_" + label, half, edge_w, threshold,
+                                                scale1, density))
+            a.set_actor_scale3d(V((size[0] / SVT_RES, size[1] / SVT_RES, size[2] / SVT_RES)))
+            return a
+        # fallback when the VDB could not be imported: solid blocks with the moving-noise surface
+        return spawn_mesh(cube, mats.get("cloud"), loc, (size[0] / 100, size[1] / 100, size[2] / 100), label)
+
+    for name, g in data["gates"].items():
+        actors[name] = cloud(name, (g["x_keys"][0]["x_cm"], g["y_cm"], g["z_cm"]), g["size_cm"], (0.5, 0.5, 0.05))
+    for i, pl in enumerate(data["pillars"]):
+        cloud("Pillar_%d" % i, pl["location"], pl["size_cm"], (0.5, 0.5, 0.05))
+    cloud("BackWall", data["BackWall"]["location"], data["BackWall"]["size_cm"], (0.02, 0.8, 0.02), 0.45, 900.0)
+    fl = data["CloudFloor"]
+    cloud("CloudFloor", fl["location"], fl["size_cm"], (0.02, 0.02, 0.9), 0.36, 700.0, CLOUD_DENSITY * 0.6)
+
+    # dark ground under the smoke
+    ground_z = fl["location"][2] - fl["size_cm"][2] / 2.0
+    spawn_mesh(cube, mats.get("ground"), (0, 0, ground_z - 50), (80, 60, 1), "Ground")
 
     actors["tubes"] = []
     for t in data["light_tubes"]:
         a = spawn_mesh(cyl, mats.get("tube"), t["location"], (0.1, 0.1, t["length_cm"] / 100), t["name"])
         a.static_mesh_component.set_cast_shadow(False)
+        light = stage("tube light " + t["name"], tube_light, t)
         actors["tubes"].append((a, t))
+        if light is not None:
+            actors.setdefault("tube_lights", []).append((light, t))
     for i, w in enumerate(data["wires"]):
         spawn_mesh(cyl, mats.get("wire"), w["location"], (0.016, 0.016, w["length_cm"] / 100), "Wire_%02d" % i)
 
     stage("lights", build_lights)
     stage("smoke fog", build_fog)
+    stage("post process (exposure, b&w grade, bloom)", build_post_process)
 
     # Cine camera - lens/filmback matching Blender (35 mm on a 36 mm sensor, f/8)
     cam_data = data["camera"]
@@ -258,12 +414,29 @@ def build_set(data, logo_mesh, mats):
     return actors
 
 
+def tube_light(t):
+    """Long thin rect light inside each tube: lights the clouds and glows in the volumetric fog."""
+    a = spawn(unreal.RectLight, t["location"], (0, 0, -90), t["name"] + "_Light")
+    c = a.get_component_by_class(unreal.RectLightComponent)
+    set_first(c, ["intensity_units"], unreal.LightUnits.LUMENS)
+    c.set_intensity(TUBE_LIGHT_LUMENS)
+    set_first(c, ["source_width"], 10.0)
+    set_first(c, ["source_height"], float(t["length_cm"]))
+    set_first(c, ["attenuation_radius"], 1800.0)
+    set_first(c, ["volumetric_scattering_intensity"], TUBE_FOG_SCATTER)
+    set_first(c, ["cast_shadows"], False)
+    set_first(c, ["light_color"], unreal.Color(255, 248, 238, 255))
+    a.set_actor_hidden_in_game(True)
+    return a
+
+
 def build_lights():
     # Lights (same layout idea as the Blender scene: soft top key, front fill, skylight)
     key = spawn(unreal.RectLight, (0, 300, 1700), (0, -78, 90), "Key_Top")
     kc = key.get_component_by_class(unreal.RectLightComponent)
     kc.set_editor_property("intensity_units", unreal.LightUnits.LUMENS)
-    kc.set_intensity(60000.0)
+    kc.set_intensity(KEY_LUMENS)
+    set_first(kc, ["volumetric_scattering_intensity"], 1.0)
     kc.set_editor_property("source_width", 1800.0)
     kc.set_editor_property("source_height", 600.0)
     kc.set_editor_property("attenuation_radius", 6000.0)
@@ -271,16 +444,12 @@ def build_lights():
     fill = spawn(unreal.RectLight, (0, 2400, 1200), (0, -25, -90), "Fill_Front")
     fc = fill.get_component_by_class(unreal.RectLightComponent)
     fc.set_editor_property("intensity_units", unreal.LightUnits.LUMENS)
-    fc.set_intensity(15000.0)
+    fc.set_intensity(FILL_LUMENS)
+    set_first(fc, ["volumetric_scattering_intensity"], 0.3)
     fc.set_editor_property("source_width", 2000.0)
     fc.set_editor_property("source_height", 2000.0)
     fc.set_editor_property("attenuation_radius", 8000.0)
 
-    sky = spawn(unreal.SkyLight, (0, 0, 2000), label="SkyLight")
-    sc = sky.get_component_by_class(unreal.SkyLightComponent)
-    sc.set_editor_property("source_type", unreal.SkyLightSourceType.SLS_CAPTURED_SCENE)
-    sc.set_editor_property("real_time_capture", True)
-    sc.set_intensity(0.15)
 
 
 
@@ -296,11 +465,39 @@ def set_first(obj, names, value):
     return None
 
 
+def build_post_process():
+    ppv = spawn(unreal.PostProcessVolume, (0, 0, 0), label="SeagmaGrade")
+    set_first(ppv, ["unbound", "b_unbound"], True)
+    ps = ppv.get_editor_property("settings")
+
+    def ov(name, value):
+        try:
+            ps.set_editor_property("override_" + name, True)
+            ps.set_editor_property(name, value)
+        except Exception as exc:
+            unreal.log_warning("[SeagmaAnim] post process %s not set: %s" % (name, exc))
+
+    ov("auto_exposure_method", unreal.AutoExposureMethod.AEM_MANUAL)
+    ov("auto_exposure_apply_physical_camera_exposure", False)
+    ov("auto_exposure_bias", EXPOSURE_BIAS)
+    ov("color_saturation", unreal.Vector4(SATURATION, SATURATION, SATURATION, 1.0))
+    ov("color_contrast", unreal.Vector4(1.25, 1.25, 1.25, 1.0))
+    ov("bloom_intensity", 0.9)
+    ov("bloom_threshold", 1.0)
+    ov("vignette_intensity", 0.55)
+    ov("film_grain_intensity", 0.12)
+    ov("local_exposure_highlight_contrast_scale", 0.9)
+    ppv.set_editor_property("settings", ps)
+
+
 def build_fog():
     fog = spawn(unreal.ExponentialHeightFog, (0, 0, -400), label="SmokeFog")
     fogc = fog.get_component_by_class(unreal.ExponentialHeightFogComponent)
-    set_first(fogc, ["fog_density"], 0.03)
-    set_first(fogc, ["fog_height_falloff"], 0.6)
+    set_first(fogc, ["fog_density"], 0.012)
+    set_first(fogc, ["fog_height_falloff"], 0.35)
+    set_first(fogc, ["fog_inscattering_luminance", "fog_inscattering_color"], unreal.LinearColor(0.004, 0.004, 0.0045, 1))
+    set_first(fogc, ["volumetric_fog_scattering_distribution"], 0.6)
+    set_first(fogc, ["volumetric_fog_albedo"], unreal.Color(200, 200, 205, 255))
     set_first(fogc, ["enable_volumetric_fog", "volumetric_fog", "b_enable_volumetric_fog"], True)
     set_first(fogc, ["volumetric_fog_extinction_scale"], 2.0)
 
@@ -430,6 +627,10 @@ def animate_sequence(seq, data, actors):
         stage("sequence: gates open", key_gates, data, gate_actors, bind(gate_actors), end)
     if tubes:
         stage("sequence: light tube strobes", key_tubes, tubes, bind([a for a, _ in tubes]), end)
+    tube_lights = actors.get("tube_lights", [])
+    if tube_lights:
+        stage("sequence: tube light strobes (fog glow)", key_tubes, tube_lights,
+              bind([a for a, _ in tube_lights]), end)
     stage("sequence: fade in", key_fade, seq, data, end)
 
     eal.save_loaded_asset(seq)
@@ -505,10 +706,16 @@ def key_fade(seq, data, end):
 # --------------------------------------------------------------------------- main
 def make_materials():
     mats = {}
-    for key, fn in (("chrome", make_chrome), ("cloud", make_cloud), ("tube", make_tube), ("wire", make_wire)):
+    for key, fn in (("chrome", make_chrome), ("cloud", make_cloud), ("tube", make_tube), ("wire", make_wire),
+                    ("ground", make_ground)):
         m = stage("material " + key, fn)
         if m is not None:
             mats[key] = m
+    svt = stage("import cloud VDB -> Sparse Volume Texture", import_cloud_svt)
+    if svt is not None:
+        vm = stage("material cloud volume (Heterogeneous Volume)", make_cloud_volume_material, svt)
+        if vm is not None:
+            mats["cloud_volume"] = vm
     return mats
 
 
